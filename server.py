@@ -1,18 +1,19 @@
 from aiohttp import web
-
 import pint
-
 import yaml
 import paho.mqtt.client as mqtt
 import json
 import argparse
 import time
 
+# Initialize a unit registry for handling unit conversions
 ureg = pint.UnitRegistry()
 
-imperalUnits = {"km": "mi", "°C": "°F", "km/h": "mph", "m": "ft"}
+# Define mappings for imperial unit conversions
+imperial_units = {"km": "mi", "°C": "°F", "km/h": "mph", "m": "ft"}
 
-prettyPint = {
+# Define a dictionary to prettify unit representations
+pretty_pint = {
     "degC": "°C",
     "degF": "°F",
     "mile / hour": "mph",
@@ -23,7 +24,8 @@ prettyPint = {
     "foot": "ft",
 }
 
-assumedUnits = {
+# Define assumed units for specific sensor readings
+assumed_units = {
     "04": "%",
     "05": "°C",
     "0c": "rpm",
@@ -36,7 +38,8 @@ assumedUnits = {
     "31": "km",
 }
 
-assumedShortName = {
+# Define mappings for short and full sensor names
+assumed_short_name = {
     "04": "engine_load",
     "05": "coolant_temp",
     "0c": "engine_rpm",
@@ -49,7 +52,7 @@ assumedShortName = {
     "31": "dis_mil_off",
 }
 
-assumedFullName = {
+assumed_full_name = {
     "04": "Engine Load",
     "05": "Coolant Temperature",
     "0c": "Engine RPM",
@@ -62,237 +65,102 @@ assumedFullName = {
     "31": "Distance with MIL off",
 }
 
+# Global dictionary to store parsed session data
 data = {}
 
+def pretty_units(unit):
+    """Converts standard unit representation to a more readable format."""
+    return pretty_pint.get(unit, unit)
 
-def prettyUnits(unit):
-    if unit in prettyPint:
-        return prettyPint[unit]
+def unpretty_units(unit):
+    """Converts prettified unit representation back to standard format."""
+    return next((pint_unit for pint_unit, pretty_unit in pretty_pint.items() if pretty_unit == unit), unit)
 
-    return unit
-
-
-def unprettyUnits(unit):
-    for pint_unit, pretty_unit in prettyPint.items():
-        if pretty_unit == unit:
-            return pint_unit
-
-    return unit
-
-
-def convertUnits(value, u_in, u_out):
+def convert_units(value, u_in, u_out):
+    """Converts a value from one unit to another."""
     q_in = ureg.Quantity(value, u_in)
     q_out = q_in.to(u_out)
     return {"value": round(q_out.magnitude, 2), "unit": str(q_out.units)}
 
-
-def prettyConvertUnits(value, u_in, u_out):
-    p_in = unprettyUnits(u_in)
-    p_out = unprettyUnits(u_out)
-    res = convertUnits(value, p_in, p_out)
-    return {"value": res["value"], "unit": prettyUnits(res["unit"])}
-
+def pretty_convert_units(value, u_in, u_out):
+    """Converts units and returns a prettified result."""
+    p_in, p_out = unpretty_units(u_in), unpretty_units(u_out)
+    res = convert_units(value, p_in, p_out)
+    return {"value": res["value"], "unit": pretty_units(res["unit"])}
 
 async def process_torque(request):
+    """Handles incoming HTTP requests, processes data, and publishes to MQTT."""
     session = parse_fields(request.query)
     publish_data(session)
     return web.Response(text="OK!")
 
-
-def parse_fields(qdata):  # noqa
+def parse_fields(qdata):
+    """Parses incoming query data and stores it in the session dictionary."""
     session = qdata.get("session")
     if session is None:
         raise Exception("No Session")
+    
+    # Initialize session if not already present
+    data.setdefault(session, {
+        "profile": {},
+        "unit": {},
+        "defaultUnit": {},
+        "fullName": {},
+        "shortName": {},
+        "value": {},
+        "unknown": [],
+        "time": 0,
+    })
 
-    if session not in data:
-        data[session] = {
-            "profile": {},
-            "unit": {},
-            "defaultUnit": {},
-            "fullName": {},
-            "shortName": {},
-            "value": {},
-            "unknown": [],
-            "time": 0,
-        }
-
+    # Process query data
     for key, value in qdata.items():
         if key.startswith("userUnit"):
             continue
-        if key.startswith("userShortName"):
-            item = key[13:]
-            data[session]["shortName"][item] = value
-            continue
-        if key.startswith("userFullName"):
-            item = key[12:]
-            data[session]["fullName"][item] = value
-            continue
-        if key.startswith("defaultUnit"):
-            item = key[11:]
-            data[session]["defaultUnit"][item] = value
-            continue
-        if key.startswith("k"):
-            item = key[1:]
-            if len(item) == 1:
-                item = "0" + item
-            data[session]["value"][item] = value
-            continue
-        if key.startswith("profile"):
-            item = key[7:]
-            data[session]["profile"][item] = value
-            continue
-        if key == "eml":
-            data[session]["profile"]["email"] = value
-            continue
-        if key == "time":
-            data[session]["time"] = value
-            continue
-        if key == "v":
-            data[session]["profile"]["version"] = value
-            continue
-        if key == "session":
-            continue
-        if key == "id":
-            data[session]["profile"]["id"] = value
-            continue
-
-        data[session]["unknown"].append({"key": key, "value": value})
-
+        
+        prefixes = {
+            "userShortName": ("shortName", 13),
+            "userFullName": ("fullName", 12),
+            "defaultUnit": ("defaultUnit", 11),
+            "k": ("value", 1),
+            "profile": ("profile", 7)
+        }
+        
+        for prefix, (target, offset) in prefixes.items():
+            if key.startswith(prefix):
+                item = key[offset:]
+                if prefix == "k" and len(item) == 1:
+                    item = "0" + item
+                data[session][target][item] = value
+                break
+        else:
+            if key in {"eml", "time", "v", "session", "id"}:
+                profile_keys = {"eml": "email", "v": "version", "id": "id"}
+                data[session]["profile"].setdefault(profile_keys.get(key, key), value)
+            else:
+                data[session]["unknown"].append({"key": key, "value": value})
+    
     return session
 
-
-def slugify(name):
-    return (
-        name.lower()
-        .replace("(", " ")
-        .replace(")", " ")
-        .strip()
-        .replace(" ", "_")
-    )
-
-
-def get_field(session, key):
-    name = data[session]["fullName"].get(key, assumedFullName.get(key, key))
-    short_name = data[session]["shortName"].get(
-        key, assumedShortName.get(key, key)
-    )
-    unit = data[session]["defaultUnit"].get(key, assumedUnits.get(key, ""))
-    value = data[session]["value"].get(key)
-    short_name = slugify(short_name)
-
-    if config.get("imperial") is True:
-        if unit in imperalUnits:
-            conv = prettyConvertUnits(float(value), unit, imperalUnits[unit])
-            value = conv["value"]
-            unit = conv["unit"]
-
-    return {
-        "name": name,
-        "short_name": short_name,
-        "unit": unit,
-        "value": value,
-    }
-
-
-def get_profile(session):
-    return data[session]["profile"]
-
-
-def get_topic_prefix(session):
-    topic = data[session]["profile"].get("Name")
-    if topic is None:
-        topic = data[session]["profile"].get("email")
-    if topic is None:
-        topic = session
-
-    topic = slugify(topic)
-
-    return config["mqtt"]["prefix"] + "/" + topic
-
-
-def get_data(session):
-    retdata = {}
-    retdata["profile"] = get_profile(session)
-    retdata["time"] = data[session]["time"]
-    meta = {}
-
-    for key, value in data[session]["value"].items():
-        row_data = get_field(session, key)
-        retdata[row_data["short_name"]] = row_data["value"]
-        meta[row_data["short_name"]] = {
-            "name": row_data["name"],
-            "unit": row_data["unit"],
-        }
-
-    retdata["meta"] = meta
-
-    return retdata
-
-
 def publish_data(session):
-    session_data = get_data(session)
-    mqttc.publish(get_topic_prefix(session), json.dumps(session_data))
-
-
-mqttc = None
-mqttc_time = time.time()
-
-
-def mqtt_on_connect(client, userdata, flags, rc):
-    if rc != 0:
-        print("MQTT Connection Issue")
-        exit()
-
-
-def mqtt_on_disconnect(client, userdata, rc):
-    print("MQTT Disconnected")
-    if time.time() > mqttc_time + 10:
-        mqttc_create()
-    else:
-        exit()
-
+    """Publishes parsed data to MQTT."""
+    mqttc.publish(get_topic_prefix(session), json.dumps(get_data(session)))
 
 def mqttc_create():
-    global mqttc
-    global mqttc_time
+    """Creates and configures the MQTT client."""
+    global mqttc, mqttc_time
     mqttc = mqtt.Client(client_id="torque", clean_session=True)
-    mqttc.username_pw_set(
-        username=config["mqtt"].get("username"),
-        password=config["mqtt"].get("password"),
-    )
-    print("CALLING MQTT CONNECT")
-    mqttc.connect(
-        config["mqtt"]["host"], config["mqtt"].get("port", 1883), keepalive=60
-    )
-    mqttc.on_connect = mqtt_on_connect
-    mqttc.mqtt_on_disconnect = mqtt_on_disconnect
+    mqttc.username_pw_set(username=config["mqtt"].get("username"), password=config["mqtt"].get("password"))
+    mqttc.connect(config["mqtt"]["host"], config["mqtt"].get("port", 1883), keepalive=60)
     mqttc.loop_start()
     mqttc_time = time.time()
 
-
-argparser = argparse.ArgumentParser()
-argparser.add_argument(
-    "-c",
-    "--config",
-    required=True,
-    help="Directory holding config.yaml and application storage",
-)
-args = argparser.parse_args()
-
-configdir = args.config
-if not configdir.endswith("/"):
-    configdir = configdir + "/"
-
-with open(configdir + "config.yaml") as file:
+# Load configuration
+args = argparse.ArgumentParser().add_argument("-c", "--config", required=True, help="Directory holding config.yaml").parse_args()
+with open(args.config.rstrip("/") + "/config.yaml") as file:
     config = yaml.load(file, Loader=yaml.FullLoader)
 
 mqttc_create()
 
-
+# Start the web server
 if __name__ == "__main__":
-    host = config.get("server", {}).get("ip", "0.0.0.0")
-    port = config.get("server", {}).get("port", 5000)
-
-    app = web.Application()
-    app.router.add_get("/", process_torque)
-    web.run_app(app, host=host, port=port)
+    web.run_app(web.Application().router.add_get("/", process_torque), host=config.get("server", {}).get("ip", "0.0.0.0"), port=config.get("server", {}).get("port", 5000))
